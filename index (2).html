@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JARVIS Mark-IV Spatial OS</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<style>
+*{box-sizing:border-box;user-select:none;-webkit-user-select:none}
+html,body{margin:0;width:100%;height:100%;background:#020408;color:#00f3ff;font-family:Consolas,'Courier New',monospace;overflow:hidden}
+#viewport{position:absolute;left:50%;top:50%;width:1280px;height:720px;transform:translate(-50%,-50%);border-radius:14px;background:#000;overflow:hidden;
+box-shadow:0 0 0 2px rgba(0,243,255,.6),0 0 60px rgba(0,243,255,.25),inset 0 0 40px rgba(0,243,255,.1)}
+video{display:none}
+canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
+#boot{position:absolute;inset:0;background:radial-gradient(circle,#06152d 0%,#020408 100%);z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;transition:opacity .6s;text-align:center;padding:20px}
+.ring{width:130px;height:130px;border:3px solid #00f3ff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:38px;box-shadow:0 0 30px #00f3ff,inset 0 0 20px #00f3ff;animation:pulse 1.5s infinite alternate;margin-bottom:20px}
+@keyframes pulse{from{transform:scale(.92);opacity:.7}to{transform:scale(1.08);opacity:1}}
+@media(prefers-reduced-motion:reduce){.ring{animation:none}}
+h2{margin:0;letter-spacing:3px}
+#bootmsg{color:#ff0055;font-size:13px;margin:10px 0 0}
+#hint{color:#6fa8b3;font-size:12px;margin-top:18px;max-width:640px;line-height:1.6}
+</style>
+</head>
+<body>
+<div id="viewport">
+  <video id="webcam" playsinline muted></video>
+  <canvas id="hud" width="1280" height="720"></canvas>
+  <div id="boot" role="button" tabindex="0">
+    <div class="ring">⚡</div>
+    <h2>INITIALIZE JARVIS MARK-IV OS</h2>
+    <p id="bootmsg">[ CLICK TO ARM 3D CORE &amp; GESTURE MATRIX ]</p>
+    <p id="hint">Point = draw · Pinch = grab widgets / move core · Two pinches = scale · Fist drag = rotate · Spider sign = web blast. No camera? Mouse and touch work too. Keys: M model, C color, D draw, E clear, S sound.</p>
+  </div>
+</div>
+
+<script>
+'use strict';
+const W = 1280, H = 720;
+const $ = id => document.getElementById(id);
+const vp = $('viewport'), video = $('webcam'), cv = $('hud'), ctx = cv.getContext('2d');
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const hit = (x, y, r) => x > r.x && x < r.x + r.w && y > r.y && y < r.y + r.h;
+
+// Fit the fixed 1280x720 stage to any window
+function fit() { vp.style.transform = `translate(-50%,-50%) scale(${Math.min(innerWidth / (W + 24), innerHeight / (H + 24))})`; }
+addEventListener('resize', fit); fit();
+
+// ======================== AUDIO & VOICE ========================
+let audioCtx = null, sound = true;
+function speak(t) {
+  if (!sound || !window.speechSynthesis) return;
+  try { speechSynthesis.cancel(); const m = new SpeechSynthesisUtterance(t); m.rate = 1.1; m.pitch = .85; m.volume = .8; speechSynthesis.speak(m); } catch (e) {}
+}
+function tone(f, type = 'sine', d = .15, v = .08, to = null) {
+  if (!audioCtx || !sound) return;
+  try {
+    const t = audioCtx.currentTime, o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, t);
+    if (to) o.frequency.exponentialRampToValueAtTime(to, t + d);
+    g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(.001, t + d);
+    o.connect(g); g.connect(audioCtx.destination); o.start(t); o.stop(t + d);
+  } catch (e) {}
+}
+
+// ======================== STATE ========================
+const COLORS = ['#00f3ff', '#ff0055', '#00ff88', '#ffcc00', '#b829ff'];
+const MODELS = ['4D TESSERACT', 'CYBER SPHERE', 'QUANTUM OCTAHEDRON', 'DNA HELIX'];
+let colorIdx = 0, drawing = true, strokes = [], particles = [], waves = [];
+let shake = 0, radar = 0, fps = 60, time = 0, mode = 'STANDBY', camOn = false, booted = false;
+let modelIdx = 0, lastBlast = -9, lastThumb = -9, dual = null, lastRes = 0, tracker = null, prevCount = 0;
+const logs = ['[SYS] Waiting for biometric link...'];
+const addLog = m => { logs.unshift(`[${new Date().toLocaleTimeString('en-GB')}] ${m}`); if (logs.length > 7) logs.pop(); };
+const core = { x: W / 2, y: H / 2 - 20, scale: .9, target: .9, rotX: .4, rotY: .6, spin: true };
+
+const newSlot = () => ({ present: false, x: W / 2, y: H / 2, tx: W / 2, ty: H / 2, rx: 0, ry: 0, rtx: 0, rty: 0, vx: 0, vy: 0,
+  gesture: 'NONE', cand: '', n: 0, pinched: false, lm: null, grab: null, stroke: null, snap: true });
+const slots = [newSlot(), newSlot()];
+
+// ======================== 3D GEOMETRY (built once) ========================
+function geometry(type) {
+  const v = [], e = [];
+  if (type === 0) {
+    for (let i = 0; i < 16; i++) { const r = i < 8 ? 50 : 95; v.push([i & 1 ? r : -r, i & 2 ? r : -r, i & 4 ? r : -r]); }
+    for (let i = 0; i < 16; i++) for (let j = i + 1; j < 16; j++) { const d = i ^ j; if (d === 1 || d === 2 || d === 4 || d === 8) e.push([i, j]); }
+  } else if (type === 1) {
+    const rings = 6, segs = 10, rad = 90;
+    for (let r = 0; r <= rings; r++) for (let s = 0; s < segs; s++) {
+      const p = r / rings * Math.PI, t = s / segs * Math.PI * 2, c = r * segs + s;
+      v.push([rad * Math.sin(p) * Math.cos(t), rad * Math.cos(p), rad * Math.sin(p) * Math.sin(t)]);
+      e.push([c, r * segs + (s + 1) % segs]);
+      if (r < rings) e.push([c, (r + 1) * segs + s]);
+    }
+  } else if (type === 2) {
+    const r = 100;
+    v.push([0, -r, 0], [0, r, 0], [-r, 0, 0], [r, 0, 0], [0, 0, -r], [0, 0, r]);
+    e.push([0,2],[0,3],[0,4],[0,5],[1,2],[1,3],[1,4],[1,5],[2,4],[4,3],[3,5],[5,2]);
+  } else {
+    const n = 18, rad = 70;
+    for (let i = 0; i < n; i++) {
+      const a = i * .4, y = (i - n / 2) * 12;
+      v.push([Math.cos(a) * rad, y, Math.sin(a) * rad], [Math.cos(a + Math.PI) * rad, y, Math.sin(a + Math.PI) * rad]);
+      if (i) e.push([i * 2, i * 2 - 2], [i * 2 + 1, i * 2 - 1]);
+      e.push([i * 2, i * 2 + 1]);
+    }
+  }
+  return { v, e };
+}
+const GEO = [0, 1, 2, 3].map(geometry);
+
+function draw3DCore(dt) {
+  core.scale += (core.target - core.scale) * (1 - Math.pow(.88, dt * 60));
+  if (core.spin) { core.rotY += .6 * dt; core.rotX += .3 * dt; }
+  const { v, e } = GEO[modelIdx], sc = core.scale, col = COLORS[colorIdx];
+  const cX = Math.cos(core.rotX), sX = Math.sin(core.rotX), cY = Math.cos(core.rotY), sY = Math.sin(core.rotY);
+  const p = v.map(([x, y, z]) => {
+    const x1 = x * cY - z * sY, z1 = z * cY + x * sY, y2 = y * cX - z1 * sX, z2 = z1 * cX + y * sX;
+    const f = 350 / Math.max(120, 350 + z2);
+    return [core.x + x1 * f * sc, core.y + y2 * f * sc];
+  });
+  ctx.save();
+  ctx.strokeStyle = 'rgba(0,243,255,.25)'; ctx.lineWidth = 1.5; ctx.setLineDash([8, 12]);
+  ctx.beginPath(); ctx.arc(core.x, core.y, 125 * sc, radar, radar + Math.PI * 1.8); ctx.stroke(); ctx.setLineDash([]);
+  ctx.strokeStyle = col; ctx.lineWidth = 1.8; ctx.shadowBlur = 10; ctx.shadowColor = col;
+  ctx.beginPath();
+  e.forEach(([a, b]) => { ctx.moveTo(p[a][0], p[a][1]); ctx.lineTo(p[b][0], p[b][1]); });
+  ctx.stroke(); ctx.shadowBlur = 0;
+  ctx.fillStyle = '#00f3ff'; ctx.font = 'bold 12px Consolas'; ctx.textAlign = 'center';
+  ctx.fillText(`◈ ${MODELS[modelIdx]} [${sc.toFixed(2)}x]`, core.x, core.y + 145 * sc);
+  ctx.restore();
+}
+
+// ======================== WIDGETS, BUTTONS, PADS ========================
+const widgets = [
+  { title: 'REACTOR TELEMETRY', x: 50, y: 120, w: 210, h: 95, vx: 0, vy: 0, col: '#00f3ff',
+    lines: () => [`CORE TEMP: ${3420 + Math.round(Math.sin(time * 1.3) * 18)} K`, `OUTPUT: ${(12.8 + Math.sin(time) * .2).toFixed(1)} GJ/s`, 'STATUS: NOMINAL'] },
+  { title: 'NEURAL MATRIX', x: 50, y: 240, w: 210, h: 95, vx: 0, vy: 0, col: '#ff0055',
+    lines: () => [`SYNAPSE LINK: ${(99.4 + Math.sin(time * .7) * .3).toFixed(1)}%`, `LATENCY: ${(4.2 + Math.sin(time * 2) * .4).toFixed(1)} ms`, 'LOCK: NEW DELHI'] }
+];
+const bounds = { l: 15, r: W - 15, t: 65, b: H - 150 };
+
+function nextModel() { modelIdx = (modelIdx + 1) % MODELS.length; tone(520, 'triangle', .2, .1, 880); speak(MODELS[modelIdx]); addLog(`3D core: ${MODELS[modelIdx]}`); }
+function nextColor() { colorIdx = (colorIdx + 1) % COLORS.length; tone(660, 'sine', .15, .1); addLog('Laser frequency tuned'); }
+function toggleDraw() { drawing = !drawing; tone(440, 'sine', .15); addLog(`Draw ${drawing ? 'on' : 'off'}`); }
+function toggleSound() { sound = !sound; if (!sound && window.speechSynthesis) speechSynthesis.cancel(); else tone(600, 'sine', .15); addLog(`Sound ${sound ? 'on' : 'off'}`); }
+function emp() {
+  strokes = []; slots.forEach(s => s.stroke = null);
+  core.target = .9; core.x = W / 2; core.y = H / 2 - 20;
+  waves.push({ x: W / 2, y: H / 2, r: 10, max: 750, col: '#00f3ff' });
+  tone(180, 'sawtooth', .5, .15, 45); speak('Workspace cleared.'); addLog('EMP blast: workspace cleared');
+}
+const bx = W - 165;
+const buttons = [
+  { label: () => '🧊 3D MODEL', y: 80, col: '#00f3ff', act: nextModel },
+  { label: () => '🎨 INK COLOR', y: 135, col: '#ff0055', act: nextColor },
+  { label: () => `✍️ DRAW: ${drawing ? 'ON' : 'OFF'}`, y: 190, col: '#00ff88', act: toggleDraw },
+  { label: () => '💥 EMP CLEAR', y: 245, col: '#ff3333', act: emp },
+  { label: () => `🔊 SOUND: ${sound ? 'ON' : 'OFF'}`, y: 300, col: '#ffcc00', act: toggleSound }
+].map(b => Object.assign(b, { x: bx, w: 145, h: 42, prog: 0, lock: false }));
+
+const pads = [['C4', 261.6, '#00f3ff'], ['E4', 329.6, '#00ff88'], ['G4', 392, '#ffcc00'], ['B4', 493.9, '#ff0055']]
+  .map(([note, freq, col], i) => ({ note, freq, col, x: 400 + i * 100, y: H - 68, w: 90, h: 50, flash: 0, in: false }));
+
+const overUI = (x, y) => buttons.some(b => hit(x, y, b)) || pads.some(p => hit(x, y, p)) || widgets.some(w => hit(x, y, w));
+const grabbable = (x, y) => widgets.some(w => hit(x, y, w)) || Math.hypot(x - core.x, y - core.y) < 110 * core.scale + 20;
+
+// ======================== GESTURES ========================
+function classify(s) {
+  const lm = s.lm, d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
+  const size = d(0, 9) || .1, up = (t, p) => d(t, 0) > d(p, 0) * 1.12;
+  const i = up(8, 6), m = up(12, 10), r = up(16, 14), p = up(20, 18);
+  const ratio = d(8, 4) / size;
+  s.pinched = s.pinched ? ratio < .5 : ratio < .3;           // hysteresis: no flicker at the threshold
+  if (s.pinched) return 'PINCH';
+  if (!i && !m && !r && !p) {
+    const top = Math.min(lm[8].y, lm[12].y, lm[16].y, lm[20].y);
+    return lm[4].y < lm[3].y && lm[4].y < top - .03 ? 'THUMBS_UP' : 'FIST';
+  }
+  if (i && p && !m && !r) return 'WEB_BLAST';
+  if (i && m && !r && !p) return 'PEACE';
+  if (i && !m && !r && !p) return 'POINT';
+  return 'PALM';
+}
+function clearSlot(s) {
+  endStroke(s); s.grab = null; s.present = false; s.gesture = 'NONE'; s.lm = null; s.pinched = false; s.cand = ''; s.n = 0;
+}
+function ingest(lms) {
+  const list = lms.slice(0, 2).sort((a, b) => b[0].x - a[0].x);   // stable left/right identity (mirrored)
+  if (list.length !== prevCount) slots.forEach(s => s.snap = true);
+  prevCount = list.length;
+  slots.forEach((s, i) => {
+    const lm = list[i];
+    if (!lm) { if (s.present) clearSlot(s); return; }
+    s.present = true; s.lm = lm;
+    s.rx = (1 - lm[8].x) * W; s.ry = lm[8].y * H; s.rtx = (1 - lm[4].x) * W; s.rty = lm[4].y * H;
+    const g = classify(s);
+    if (g === s.cand) s.n++; else { s.cand = g; s.n = 1; }
+    if (s.n >= 2 || s.gesture === 'NONE') s.gesture = g;      // 2-frame debounce
+  });
+}
+
+// ======================== EFFECTS ========================
+function spawn(x, y, col, n = 4, spd = 5) {
+  for (let i = 0; i < n; i++) { const a = Math.random() * 6.283, v = Math.random() * spd + 1; particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 1, col }); }
+  if (particles.length > 500) particles.splice(0, particles.length - 500);
+}
+function endStroke(s) {
+  if (s.stroke && s.stroke.pts.length < 2) strokes = strokes.filter(k => k !== s.stroke);
+  s.stroke = null;
+}
+
+// ======================== UPDATE ========================
+const mouse = { on: false, x: W / 2, y: H / 2, down: false, kind: 'PALM' };
+function update(dt) {
+  time += dt; radar += 1.8 * dt;
+  const f60 = dt * 60;
+  if (camOn && performance.now() - lastRes > 700) ingest([]);   // tracker stalled: treat hands as lost
+
+  if (mode === 'MOUSE') {
+    const s = slots[0];
+    if (mouse.on) {
+      s.present = true; s.rx = s.rtx = mouse.x; s.ry = s.rty = mouse.y; s.snap = true;
+      s.gesture = mouse.down ? mouse.kind : 'PALM';
+    } else if (s.present) clearSlot(s);
+  }
+
+  slots.forEach(s => {
+    if (!s.present) return;
+    const a = s.snap ? 1 : 1 - Math.pow(.55, f60); s.snap = false;
+    const nx = s.x + (s.rx - s.x) * a, ny = s.y + (s.ry - s.y) * a;
+    s.vx = s.vx * .6 + (nx - s.x) / f60 * .4; s.vy = s.vy * .6 + (ny - s.y) / f60 * .4;
+    s.x = nx; s.y = ny; s.tx += (s.rtx - s.tx) * a; s.ty += (s.rty - s.ty) * a;
+  });
+
+  const pinchers = slots.filter(s => s.present && s.gesture === 'PINCH');
+  const both = pinchers.length === 2 && pinchers.every(s => !s.grab || s.grab.t !== 'w');
+  core.spin = !slots.some(s => s.present && s.gesture === 'FIST');
+
+  slots.forEach(s => {
+    if (!s.present) return;
+    const mx = (s.x + s.tx) / 2, my = (s.y + s.ty) / 2;
+
+    if (s.gesture === 'PINCH') {
+      if (!s.grab) {
+        const taken = o => slots.some(k => k !== s && k.grab && k.grab.o === o);
+        const w = [...widgets].reverse().find(w => hit(mx, my, w) && !taken(w));
+        if (w) s.grab = { t: 'w', o: w, ox: w.x - mx, oy: w.y - my };
+        else if (Math.hypot(mx - core.x, my - core.y) < 110 * core.scale + 20) s.grab = { t: 'c', ox: core.x - mx, oy: core.y - my };
+        else s.grab = { t: 'none' };
+      }
+      if (s.grab.t === 'w') {
+        const w = s.grab.o;
+        w.x = clamp(mx + s.grab.ox, bounds.l, bounds.r - w.w); w.y = clamp(my + s.grab.oy, bounds.t, bounds.b - w.h);
+        w.vx = s.vx * .6; w.vy = s.vy * .6;
+      } else if (s.grab.t === 'c' && !both) {
+        core.x = clamp(mx + s.grab.ox, 120, W - 200); core.y = clamp(my + s.grab.oy, 120, H - 150);
+      }
+    } else if (s.grab) s.grab = null;
+
+    if (s.gesture === 'FIST') { core.rotY += s.vx * .012; core.rotX += s.vy * .012; }
+
+    if (s.gesture === 'POINT' && drawing && !overUI(s.x, s.y)) {
+      if (!s.stroke) { s.stroke = { col: COLORS[colorIdx], pts: [] }; strokes.push(s.stroke); if (strokes.length > 60) strokes.shift(); }
+      const last = s.stroke.pts[s.stroke.pts.length - 1];
+      if (!last || Math.hypot(s.x - last.x, s.y - last.y) > 2.5) { s.stroke.pts.push({ x: s.x, y: s.y }); if (s.stroke.pts.length > 900) s.stroke.pts.shift(); }
+      spawn(s.x, s.y, s.stroke.col, 1, 2.5);
+    } else endStroke(s);
+
+    if (s.gesture === 'WEB_BLAST' && time - lastBlast > 1.2) {
+      lastBlast = time; waves.push({ x: s.x, y: s.y, r: 15, max: 600, col: '#00ff88' });
+      spawn(s.x, s.y, '#00ff88', 30, 15); shake = 14; tone(480, 'sine', .3, .15, 120); speak('Web blast activated'); addLog('⚡ WEB BLAST DEPLOYED');
+    }
+    if (s.gesture === 'THUMBS_UP' && time - lastThumb > 2) { lastThumb = time; speak('Systems fully optimized.'); addLog('👍 AI systems optimized'); }
+  });
+
+  // Two-hand pinch scaling, relative to the scale at the moment both hands pinched
+  if (both) {
+    const [a, b] = pinchers, span = Math.hypot(a.x - b.x, a.y - b.y);
+    if (!dual) dual = { span: Math.max(span, 40), sc: core.target };
+    else core.target = clamp(dual.sc * span / dual.span, .4, 2.2);
+  } else dual = null;
+
+  // Dwell buttons: fire once, then re-arm only after the hand leaves
+  buttons.forEach(b => {
+    const on = slots.some(s => s.present && hit(s.x, s.y, b));
+    if (!on) { b.lock = false; b.prog = Math.max(0, b.prog - dt * 2); }
+    else if (!b.lock) { b.prog += dt / .8; if (b.prog >= 1) { b.prog = 0; b.lock = true; b.act(); } }
+    else b.prog = 0;
+  });
+  // Pads: trigger on entry
+  pads.forEach(p => {
+    const s = slots.find(s => s.present && hit(s.x, s.y, p));
+    if (s && !p.in) { tone(p.freq, 'triangle', .35, .12); spawn(s.x, s.y, p.col, 10, 6); p.flash = .15; }
+    p.in = !!s; p.flash = Math.max(0, p.flash - dt);
+  });
+
+  widgets.forEach(w => {
+    if (slots.some(s => s.grab && s.grab.o === w)) return;
+    w.x += w.vx * f60; w.y += w.vy * f60; const d = Math.pow(.92, f60); w.vx *= d; w.vy *= d;
+    if (w.x < bounds.l) { w.x = bounds.l; w.vx *= -.8; }
+    if (w.x + w.w > bounds.r) { w.x = bounds.r - w.w; w.vx *= -.8; }
+    if (w.y < bounds.t) { w.y = bounds.t; w.vy *= -.8; }
+    if (w.y + w.h > bounds.b) { w.y = bounds.b - w.h; w.vy *= -.8; }
+  });
+
+  waves = waves.filter(w => (w.r += 1080 * dt) < w.max);
+  particles = particles.filter(p => { p.x += p.vx * f60; p.y += p.vy * f60; return (p.life -= 1.8 * dt) > 0; });
+  if (shake > 0) { shake *= Math.pow(.85, f60); if (shake < .5) shake = 0; }
+}
+
+// ======================== RENDER ========================
+const BONES = [[0,1,2,3,4],[0,5,6,7,8],[0,9,10,11,12],[0,13,14,15,16],[0,17,18,19,20],[5,9,13,17]];
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.shadowBlur = 0; ctx.setLineDash([]); ctx.textAlign = 'left';
+  ctx.save();
+  try {
+    if (shake > 0) ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake);
+    ctx.fillStyle = '#02050a'; ctx.fillRect(-20, -20, W + 40, H + 40);
+    if (camOn && video.readyState >= 2) {
+      ctx.save(); ctx.globalAlpha = .42; ctx.scale(-1, 1); ctx.drawImage(video, -W, 0, W, H); ctx.restore();
+    }
+    ctx.strokeStyle = 'rgba(0,243,255,.07)'; ctx.lineWidth = 1; ctx.beginPath();
+    for (let x = 0; x < W; x += 80) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+    for (let y = 0; y < H; y += 80) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+    ctx.stroke();
+
+    slots.forEach((s, i) => {
+      if (!s.present) return;
+      if (s.lm) {
+        ctx.strokeStyle = i ? 'rgba(255,0,85,.55)' : 'rgba(0,243,255,.55)'; ctx.lineWidth = 2;
+        BONES.forEach(ch => { ctx.beginPath(); ch.forEach((p, k) => { const x = (1 - s.lm[p].x) * W, y = s.lm[p].y * H; k ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke(); });
+      }
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(s.x, s.y, 8, 0, 6.283); ctx.stroke();
+      if (s.gesture === 'PINCH') { ctx.fillStyle = '#ffcc00'; ctx.beginPath(); ctx.arc((s.x + s.tx) / 2, (s.y + s.ty) / 2, 12, 0, 6.283); ctx.fill(); }
+    });
+    const pair = slots.filter(s => s.present && s.gesture === 'PINCH');
+    if (pair.length === 2) {
+      ctx.strokeStyle = '#00ff88'; ctx.lineWidth = 2.5; ctx.setLineDash([8, 6]);
+      ctx.beginPath(); ctx.moveTo(pair[0].x, pair[0].y); ctx.lineTo(pair[1].x, pair[1].y); ctx.stroke(); ctx.setLineDash([]);
+    }
+
+    draw3DCore(Math.min(.05, 1 / Math.max(fps, 1)));
+
+    widgets.forEach(w => {
+      const g = slots.some(s => s.grab && s.grab.o === w);
+      ctx.fillStyle = g ? 'rgba(0,45,70,.85)' : 'rgba(4,15,28,.72)'; ctx.strokeStyle = w.col; ctx.lineWidth = g ? 2.5 : 1.5;
+      ctx.fillRect(w.x, w.y, w.w, w.h); ctx.strokeRect(w.x, w.y, w.w, w.h);
+      ctx.fillStyle = w.col; ctx.fillRect(w.x, w.y, w.w, 22);
+      ctx.fillStyle = '#000'; ctx.font = 'bold 12px Consolas'; ctx.fillText(`◈ ${w.title}`, w.x + 8, w.y + 15);
+      ctx.fillStyle = '#d0f8ff'; ctx.font = '12px Consolas';
+      w.lines().forEach((l, i) => ctx.fillText(l, w.x + 10, w.y + 42 + i * 17));
+    });
+
+    ctx.lineCap = ctx.lineJoin = 'round';
+    strokes.forEach(st => {
+      if (st.pts.length < 2) return;
+      ctx.strokeStyle = st.col; ctx.beginPath();
+      st.pts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+      ctx.globalAlpha = .25; ctx.lineWidth = 11; ctx.stroke();     // glow without per-stroke shadowBlur cost
+      ctx.globalAlpha = 1; ctx.lineWidth = 3.5; ctx.stroke();
+    });
+
+    waves.forEach(w => { ctx.strokeStyle = w.col; ctx.lineWidth = Math.max(.5, 5 * (1 - w.r / w.max)); ctx.beginPath(); ctx.arc(w.x, w.y, w.r, 0, 6.283); ctx.stroke(); });
+    particles.forEach(p => { ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.col; ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, 6.283); ctx.fill(); });
+    ctx.globalAlpha = 1;
+
+    ctx.font = 'bold 13px Consolas'; ctx.textAlign = 'left';
+    buttons.forEach(b => {
+      ctx.fillStyle = b.prog > 0 ? 'rgba(0,60,90,.85)' : 'rgba(5,18,32,.75)'; ctx.strokeStyle = b.col; ctx.lineWidth = 1.8;
+      ctx.fillRect(b.x, b.y, b.w, b.h); ctx.strokeRect(b.x, b.y, b.w, b.h);
+      if (b.prog > 0) { ctx.fillStyle = b.col; ctx.fillRect(b.x, b.y + b.h - 5, b.prog * b.w, 5); }
+      ctx.fillStyle = '#fff'; ctx.fillText(b.label(), b.x + 12, b.y + 26);
+    });
+    pads.forEach(p => {
+      ctx.fillStyle = p.flash > 0 ? p.col : 'rgba(5,20,35,.75)'; ctx.strokeStyle = p.col; ctx.lineWidth = 2;
+      ctx.fillRect(p.x, p.y, p.w, p.h); ctx.strokeRect(p.x, p.y, p.w, p.h);
+      ctx.fillStyle = p.flash > 0 ? '#000' : p.col; ctx.font = 'bold 13px Consolas'; ctx.fillText(`♪ ${p.note}`, p.x + 10, p.y + 22);
+      ctx.font = '11px Consolas'; ctx.fillText(`${Math.round(p.freq)} Hz`, p.x + 10, p.y + 40);
+    });
+
+    const first = slots.find(s => s.present), hc = slots.filter(s => s.present).length;
+    const state = mode === 'MOUSE' ? 'POINTER' : first ? first.gesture : 'SCANNING...';
+    ctx.fillStyle = 'rgba(2,12,24,.88)'; ctx.strokeStyle = '#00f3ff'; ctx.lineWidth = 1.5;
+    ctx.fillRect(15, 12, W - 30, 42); ctx.strokeRect(15, 12, W - 30, 42);
+    ctx.fillStyle = '#00f3ff'; ctx.font = 'bold 15px Consolas';
+    ctx.fillText(`⚡ JARVIS MARK-IV  |  LINK: ${mode}  |  GESTURE: ${state}  |  HANDS: ${hc}  |  FPS: ${Math.round(fps)}`, 30, 38);
+    ctx.fillStyle = 'rgba(2,10,20,.85)'; ctx.strokeStyle = 'rgba(0,243,255,.4)';
+    ctx.fillRect(15, H - 140, 360, 125); ctx.strokeRect(15, H - 140, 360, 125);
+    ctx.fillStyle = '#00ff88'; ctx.font = '11px Consolas';
+    logs.forEach((l, i) => ctx.fillText(l, 25, H - 118 + i * 16));
+  } finally { ctx.restore(); }
+}
+
+// ======================== MAIN LOOP ========================
+let lastT = performance.now(), faulted = false;
+function frame(t) {
+  requestAnimationFrame(frame);
+  const dt = clamp((t - lastT) / 1000 || .016, .001, .05); lastT = t;
+  fps += (1 / dt - fps) * .1;
+  try { update(dt); render(); }
+  catch (e) { if (!faulted) { faulted = true; console.error(e); addLog('Fault: ' + e.message); } }
+}
+requestAnimationFrame(frame);
+
+// ======================== CAMERA / TRACKER ========================
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('Camera needs https or localhost');
+  if (typeof Hands === 'undefined') throw new Error('Tracker library failed to load (offline?)');
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false });
+  try {
+    video.srcObject = stream; await video.play();
+    $('bootmsg').textContent = '[ LOADING HAND TRACKER... ]';
+    tracker = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}` });
+    tracker.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: .6, minTrackingConfidence: .6 });
+    tracker.onResults(r => { lastRes = performance.now(); ingest(r.multiHandLandmarks || []); });
+    await tracker.initialize();
+  } catch (e) { stream.getTracks().forEach(t => t.stop()); throw e; }
+  camOn = true; lastRes = performance.now(); pump();
+}
+let busy = false, pumpErrs = 0;
+async function pump() {
+  if (!camOn) return;
+  if (!busy && video.readyState >= 2) {
+    busy = true;
+    try { await tracker.send({ image: video }); }
+    catch (e) { if (++pumpErrs === 1) addLog('Tracker hiccup: recovering'); }
+    busy = false;
+  }
+  requestAnimationFrame(pump);
+}
+
+async function bootSystem() {
+  if (booted) return; booted = true;
+  try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); audioCtx.resume(); } catch (e) {}
+  tone(260, 'sawtooth', .4, .1, 920);
+  $('bootmsg').textContent = '[ REQUESTING CAMERA... ]';
+  try { await startCamera(); mode = 'GESTURE'; addLog('Biometric link established'); }
+  catch (e) { mode = 'MOUSE'; addLog(`No camera: ${e.name === 'NotAllowedError' ? 'permission denied' : e.message}`); addLog('Mouse / touch mode active'); }
+  speak(mode === 'GESTURE' ? 'Jarvis Mark 4 online. Gesture link stable.' : 'Jarvis Mark 4 online. Pointer mode.');
+  addLog('Mark-IV Spatial OS initialized');
+  const b = $('boot'); b.style.opacity = 0; setTimeout(() => b.remove(), 600);
+}
+$('boot').addEventListener('click', bootSystem);
+$('boot').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') bootSystem(); });
+
+// ======================== MOUSE / TOUCH FALLBACK + KEYS ========================
+const toXY = e => { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width * W, (e.clientY - r.top) / r.height * H]; };
+cv.addEventListener('pointermove', e => { [mouse.x, mouse.y] = toXY(e); mouse.on = true; });
+cv.addEventListener('pointerdown', e => {
+  if (mode !== 'MOUSE') return;
+  [mouse.x, mouse.y] = toXY(e); mouse.on = true;
+  const b = buttons.find(b => hit(mouse.x, mouse.y, b));
+  if (b) { b.act(); b.lock = true; return; }
+  mouse.down = true; mouse.kind = grabbable(mouse.x, mouse.y) ? 'PINCH' : 'POINT';
+  try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+});
+addEventListener('pointerup', () => { mouse.down = false; });
+cv.addEventListener('pointerleave', () => { if (!mouse.down) mouse.on = false; });
+cv.addEventListener('wheel', e => { e.preventDefault(); core.target = clamp(core.target * (e.deltaY < 0 ? 1.08 : .92), .4, 2.2); }, { passive: false });
+addEventListener('keydown', e => {
+  if (!booted) return;
+  ({ m: nextModel, c: nextColor, d: toggleDraw, e: emp, s: toggleSound })[e.key.toLowerCase()]?.();
+});
+</script>
+</body>
+</html>
